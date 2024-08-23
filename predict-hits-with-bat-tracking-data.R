@@ -8,11 +8,16 @@ library(ggplot2)
 train <- read.csv("train.csv")
 
 
+## Feature Engineering ----------------------------------------------------
 
-# Feature Engineering
+# Assumptions
+q = 0.23 # Collision Efficiency
+y0 = 50 # 50 feet
+yf = 17/12 # home plate converted to inches
+
+
 train <- train %>%
-  mutate(swing_efficiency = bat_speed / swing_length,
-         attack_zone = 'waste',
+  mutate(attack_zone = 'waste',
          attack_zone = case_when(
              plate_x >= -0.558 & 
                plate_x <= 0.558 & 
@@ -28,7 +33,22 @@ train <- train %>%
                plate_z >= 0.5 & 
                plate_z <= 4.5 & 
                !attack_zone %in% c('heart', 'shadow') ~ 'chase',
-             TRUE ~ attack_zone))
+             TRUE ~ attack_zone),
+         swing_efficiency = bat_speed / swing_length,
+         plate_speed = 0.91 * release_speed,
+         bat_speed_fps = bat_speed * 1.46667,
+         bat_speed_avg = bat_speed_fps / 2,
+         swing_time = swing_length / bat_speed_avg,
+         swing_acceleration = bat_speed_fps / swing_time,
+         max_ev = (plate_speed * q) + (bat_speed * (1 + q)),
+         movement_complexity = sqrt(pfx_x**2 + pfx_z**2),
+         
+         # Calculating Vertical Approach Angle (VAA)
+         vy_f = -sqrt(vy0**2 - (2 * ay * (y0 - yf))),
+         t = (vy_f - vy0) / ay,
+         vz_f = vz0 + (az * t),
+         VAA = -atan(vz_f / vy_f) * (180 / pi))
+
 
 
 train %>%
@@ -39,8 +59,8 @@ train %>%
 
 
 
-## Attack Zone Plot ----------------------------------------------
-ggplot(train %>% sample_n(1000), 
+## Attack Zone Plot -------------------------------------------------------
+ggplot(train %>% sample_n(2000), 
        aes(x = plate_x, 
            y = plate_z,
            shape = attack_zone,
@@ -119,7 +139,7 @@ ggplot(train %>% sample_n(1000),
   # Adjustments for equal aspect ratio and theme
   coord_fixed() +
   theme_minimal() +
-  theme(legend.position = c(1.3, 1),  # Position legend outside plot area
+  theme(legend.position = c(1.3, 1),
         legend.justification = c(1, 1),
         legend.box.just = "right",
         legend.key = element_blank(),
