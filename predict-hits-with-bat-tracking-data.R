@@ -13,10 +13,10 @@ train <- read.csv("train.csv")
 # Assumptions
 q = 0.23 # Collision Efficiency
 y0 = 50 # 50 feet
-yf = 17/12 # home plate converted to inches
+yf = 17 / 12 # home plate converted to inches
 
 
-train <- train %>%
+train_mod <- train %>%
   mutate(attack_zone = 'waste',
          attack_zone = case_when(
              plate_x >= -0.558 & 
@@ -34,6 +34,7 @@ train <- train %>%
                plate_z <= 4.5 & 
                !attack_zone %in% c('heart', 'shadow') ~ 'chase',
              TRUE ~ attack_zone),
+         batter_platoon_adv = ifelse(is_lhp != is_lhb, 1, 0),
          swing_efficiency = bat_speed / swing_length,
          plate_speed = 0.91 * release_speed,
          bat_speed_fps = bat_speed * 1.46667,
@@ -43,29 +44,88 @@ train <- train %>%
          max_ev = (plate_speed * q) + (bat_speed * (1 + q)),
          movement_complexity = sqrt(pfx_x**2 + pfx_z**2),
          
-         # Calculating Vertical Approach Angle (VAA)
+         
+         # Vertical Approach Angle (VAA)
          vy_f = -sqrt(vy0**2 - (2 * ay * (y0 - yf))),
          t = (vy_f - vy0) / ay,
          vz_f = vz0 + (az * t),
-         VAA = -atan(vz_f / vy_f) * (180 / pi))
+         VAA = -atan(vz_f / vy_f) * (180 / pi),
+         
+         
+         # Horizontal Approach Angle (HAA)
+         vx_f = vx0 + (ax * t),
+         HAA = -atan(vx_f / vy_f) * (180 / pi)) %>%
+  
+  
+  # Adjusting VAA for Pitch Type and Pitch Height
+  # Adjusting HAA for Pitch Type, Location, Handedness and Release Pos 
+  group_by(pitch_name) %>%
+  group_modify(~ {
+    vaa_model <- lm(VAA ~ plate_z, data = .x) 
+    haa_model <- lm(HAA ~ plate_x + is_lhp + release_pos_x, data = .x) 
+    .x %>% 
+      mutate(VAAAA = resid(vaa_model),
+             HAAAA = resid(haa_model))
+    }) %>%
+  ungroup() %>%
+  mutate(outcome_woba = case_when(outcome_code == "0" ~ 0,
+                                  outcome_code == "1" ~ 0.882,
+                                  outcome_code == "2" ~ 1.253,
+                                  outcome_code == "3" ~ 1.587,
+                                  outcome_code == "4" ~ 2.044)) %>%
+  
+  # Cleaning
+  as.data.frame() %>%
+  arrange(uid) %>%
+  select(-game_type, -game_year) %>% # irrelevant
+  relocate(pitch_name, .before = pitch_type) %>%
+  relocate(outcome, outcome_code, outcome_woba, .after = last_col())
 
 
 
-train %>%
-  group_by(attack_zone) %>%
-  summarize(n = n())
+
+# Exploring the new features
+train_mod %>%
+  #group_by(outcome_code, attack_zone) %>%
+  group_by(pitch_name, is_lhp) %>%
+  summarize(n = n(),
+            Avg_VAA = mean(VAA),
+            Avg_HAA = mean(HAA)) %>%
+  #filter(is_lhp == 0) %>%
+  as.data.frame()
+
+
+train_mod %>%
+  filter(pitch_type == "FF") %>%
+  filter(HAA >= 1.295 & HAA <= 1.305) %>%
+  select(uid, is_lhp, release_pos_x, plate_x, HAA, HAAAA)
+
+
+
+
+
 
 
 
 
 
 ## Attack Zone Plot -------------------------------------------------------
-ggplot(train %>% sample_n(2000), 
+ggplot(train_mod #%>% sample_n(2000),
+       ,
        aes(x = plate_x, 
            y = plate_z,
-           shape = attack_zone,
-           color = outcome)) +
-  geom_point(size = 1.5, alpha = 0.7) +
+           z = outcome_woba
+           #shape = attack_zone,
+           #color = outcome
+           )) +
+  
+
+  stat_summary_hex(bins = 50, fun = mean) +
+  scale_fill_gradient(low = "blue", 
+                      high = "red", 
+                      limits = c(0, 0.7), 
+                      name = "Average wOBA") +
+  
   
   # Draw strike zone (similar to draw_sz(ls='k--'))
   geom_rect(aes(xmin = -0.708, 
@@ -77,7 +137,7 @@ ggplot(train %>% sample_n(2000),
             linewidth = 1,
             fill = NA) +
   
-  
+
   # Draw the home plate (approximation)
   geom_segment(aes(x = -0.708, 
                    y = 0, 
@@ -153,13 +213,6 @@ ggplot(train %>% sample_n(2000),
         panel.border = element_blank(),
         panel.background = element_blank()) +
   
-  # Set color palette
-  scale_color_manual(values = c("out" = "gray", 
-                                "home_run" = "red", 
-                                "double" = "blue", 
-                                "single" = "purple",
-                                "triple" = "darkgreen")) +
-  
   # Add title and labels
   labs(color = "Outcome", shape = "Attack Zone")
 
@@ -172,6 +225,41 @@ ggplot(train %>% sample_n(2000),
 
 
 
+## VAA Plot ---------------------------------------------------------------
+
+ggplot(train_mod, aes(x = VAA, y = plate_z, color = outcome)) +
+  geom_jitter(width = 0.2, alpha = 0.6) +  
+  # Adds some randomness to the x positions to avoid overplotting
+  scale_color_manual(values = c("out" = "black", 
+                                "single" = "darkgreen",
+                                "double" = "blue",
+                                "triple" = "purple",
+                                "home_run" = "red")) +
+  labs(title = "Vertical Approach Angle Relative to Average",
+       x = "VAA",
+       y = "Pitch Height",
+       color = "Outcome") +
+  theme_minimal() +
+  xlim(-12.5, 0) +
+  theme(legend.position = "right")
+
+
+ggplot(train_mod %>% filter(pitch_name == "4-Seam Fastball"), 
+       aes(x = VAAAA, y = plate_z, color = outcome)) +
+  geom_jitter(width = 0.2, alpha = 0.6) +  
+  # Adds some randomness to the x positions to avoid overplotting
+  scale_color_manual(values = c("out" = "black", 
+                                "single" = "darkgreen",
+                                "double" = "blue",
+                                "triple" = "purple",
+                                "home_run" = "red")) +
+  labs(title = "Vertical Approach Angle Relative to Average",
+       x = "VAAAA",
+       y = "Pitch Height",
+       color = "Outcome") +
+  theme_minimal() +
+  xlim(-2.5, 2.5) +
+  theme(legend.position = "right")
 
 
 
