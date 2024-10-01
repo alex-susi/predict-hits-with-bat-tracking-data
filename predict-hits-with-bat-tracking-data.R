@@ -7,211 +7,203 @@ library(plotly)
 library(reshape2)
 library(ParBayesianOptimization)
 library(xgboost)
+library(bonsai)
+library(janitor)
 
 
 train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+
 
 
 
 ## Feature Engineering ----------------------------------------------------
 
-
-train_mod <- train %>%
-  mutate(
+preprocess <- function(df) {
+  
+  df <- df %>%
+    clean_names() %>%
     
-    # Attack Zone
-    attack_zone = 'waste',
-    attack_zone = case_when(
-      plate_x >= -0.558 & plate_x <= 0.558 &
-        plate_z >= 1.833 & plate_z <= 3.166 ~ 'heart',
-      plate_x >= -1.108 & plate_x <= 1.108 &
-        plate_z >= 1.166 & plate_z <= 3.833 &
-        attack_zone != 'heart' ~ 'shadow',
-      plate_x >= -1.666 & plate_x <= 1.666 &
-        plate_z >= 0.5 & plate_z <= 4.5 &
-        !attack_zone %in% c('heart', 'shadow') ~ 'chase',
-      TRUE ~ attack_zone),
+    mutate(across(starts_with("on_"), ~ if_else(.x == "-1", "0", "1"))) %>%
     
-    
-    # Normalizing for Batter Handedness
-    batter_platoon_adv = ifelse(is_lhp != is_lhb, 1, 0),
-    
-    across(c(spray_angle, release_pos_x, pfx_x, plate_x),
-           ~ ifelse(is_lhb == 1, -.x, .x)),
-    spray_angle = ifelse(spray_angle == 0, 0.01, spray_angle),
-    
-    direction = case_when(spray_angle <= -15 ~ "pull",
-                          spray_angle >= 15 ~ "oppo",
-                          TRUE ~ "center"),
-    
-    
-    # Swing Metrics
-    swing_efficiency = bat_speed / swing_length,
-    swing_time = swing_length / ((bat_speed * 1.46667) / 2),
-    swing_acceleration = (bat_speed * 1.46667) / swing_time,
-    max_ev = (0.91 * release_speed * 0.23) + (bat_speed * (1 + 0.23)),
-    
-    
-    movement_complexity = sqrt(pfx_x**2 + pfx_z**2),
-    
-    
-    # Estimate center of swing based on the top of the strike zone
-    swing_center_loc = map(sz_top, ~ c(-((17/12) / 2) - 6/12, 0, .)),
-    
-    
-    # Calculate the normal vector based on the spray angle
-    norm_vector = map(spray_angle, 
-                      ~ c(1, 
-                          1 / (sin(. * pi / 180) / cos(. * pi / 180)),
-                          0)),
-    
-    
-    # Calculate plane parameters
-    plane_params = map2(norm_vector,
-                        swing_center_loc,
-                        ~ c(.x, sum(.y * .x))),
-    
-    
-    # Contact Location (intersection of pitch path and plane)
-    contact_loc = pmap(
-      list(release_pos_x, plate_x, release_pos_y, 
-           plate_z, release_pos_z,
-           norm_vector, plane_params),
-      function(a, b, c, d, e, norm_vector, plane_params) {
-        b_x <- b - a
-        d_y <- 0 - c
-        f_z <- d - e
-        t <- max(
-          roots(
-            c(norm_vector[1] * b_x + norm_vector[2] * d_y,
-              norm_vector[1] * a + norm_vector[2] * c - plane_params[2])))
-        contact <- c(a + b_x * t,
-                     c + d_y * t,
-                     e + f_z * t)
-        return(contact)
+    mutate(
+      
+      # Attack Zone
+      attack_zone = 'waste',
+      attack_zone = case_when(
+        plate_x >= -0.558 & plate_x <= 0.558 &
+          plate_z >= 1.833 & plate_z <= 3.166 ~ 'heart',
+        plate_x >= -1.108 & plate_x <= 1.108 &
+          plate_z >= 1.166 & plate_z <= 3.833 &
+          attack_zone != 'heart' ~ 'shadow',
+        plate_x >= -1.666 & plate_x <= 1.666 &
+          plate_z >= 0.5 & plate_z <= 4.5 &
+          !attack_zone %in% c('heart', 'shadow') ~ 'chase',
+        TRUE ~ attack_zone),
+      
+      
+      # Normalizing for Batter Handedness
+      batter_platoon_adv = ifelse(is_lhp != is_lhb, 1, 0),
+      
+      across(c(spray_angle, release_pos_x, pfx_x, plate_x),
+             ~ ifelse(is_lhb == 1, -.x, .x)),
+      
+      spray_angle = ifelse(spray_angle == 0, 0.01, spray_angle),
+      
+      direction = case_when(spray_angle <= -15 ~ "pull",
+                            spray_angle >= 15 ~ "oppo",
+                            TRUE ~ "center"),
+      
+      
+      # Swing Metrics
+      swing_efficiency = bat_speed / swing_length,
+      swing_time = swing_length / ((bat_speed * 1.46667) / 2),
+      swing_acceleration = (bat_speed * 1.46667) / swing_time,
+      is_bunt = case_when(bat_speed <= 40 ~ 1, TRUE ~ 0),
+      estimated_ev = (bat_speed + effective_speed) / 2,
+      max_ev = (0.91 * release_speed * 0.23) + (bat_speed * (1 + 0.23)),
+      squared_up_pct = if_else(is_bunt == 1, 0, (estimated_ev / max_ev)),
+      sweet_spot_probability = 1 / (1 + exp(-(bat_speed - 70) / 10)) * 
+        (1 - abs(swing_length - 7) / 7),
+      
+      movement_complexity = sqrt(pfx_x**2 + pfx_z**2),
+      
+      
+      # Estimate center of swing based on the top of the strike zone
+      swing_center_loc = map(sz_top, ~ c(-((17/12) / 2) - 6/12, 0, .)),
+      
+      
+      # Calculate the normal vector based on the spray angle
+      norm_vector = map(spray_angle, 
+                        ~ c(1, 
+                            1 / (sin(. * pi / 180) / cos(. * pi / 180)),
+                            0)),
+      
+      
+      # Calculate plane parameters
+      plane_params = map2(norm_vector,
+                          swing_center_loc,
+                          ~ c(.x, sum(.y * .x))),
+      
+      
+      # Contact Location (intersection of pitch path and plane)
+      contact_loc = pmap(
+        list(release_pos_x, plate_x, release_pos_y, 
+             plate_z, release_pos_z,
+             norm_vector, plane_params),
+        function(a, b, c, d, e, norm_vector, plane_params) {
+          b_x <- b - a
+          d_y <- 0 - c
+          f_z <- d - e
+          t <- max(
+            roots(
+              c(norm_vector[1] * b_x + norm_vector[2] * d_y,
+                norm_vector[1] * a + norm_vector[2] * c - plane_params[2])))
+          contact <- c(a + b_x * t,
+                       c + d_y * t,
+                       e + f_z * t)
+          return(contact)
         }),
-    
-    
-    # Calculate distance to swing center
-    contact_x = map_dbl(contact_loc, 1),
-    contact_y = map_dbl(contact_loc, 2),
-    contact_z = map_dbl(contact_loc, 3),
-    dist_to_center = map2_dbl(swing_center_loc, 
-                              contact_loc,
-                              ~ sqrt(sum((.x - .y)^2))),
-    
-    
-    # Calculate swing start location and bat vector
-    swing_start_loc = map(dist_to_center, ~ c(-., 0, 0)),
-    bat_vec = map2(contact_loc, swing_center_loc, ~ .x - .y),
-    
-    
-    # Calculate central arc angle and swing radius
-    central_arc_angle = map2_dbl(
-      bat_vec,
-      swing_start_loc,
-      ~ acos(sum(.x * .y) / (sqrt(sum(.x^2)) * sqrt(sum(.y^2))))),
-    
-    swing_radius = swing_length / central_arc_angle,
-    
-    
-    # distance to sweet spot
-    dist_to_sweet_spot = pmax(pmin(swing_radius - dist_to_center, 3), -3),
-    
-    
-    # great circle vector
-    v_v1 = map(swing_start_loc, ~ . / sqrt(sum(.^2))),
-    v_v2 = map(bat_vec, ~ . / sqrt(sum(.^2))),
-    v_w = pmap(list(v_v1, v_v2),
-               function(v1, v2) {
-                 d <- sum(v1 * v2)
-                 b <- roots(c(1 - d^2, 0, -1))[1]
-                 a <- -d * b
-                 w <- a * v1 + b * v2
-                 return(w)
+      
+      
+      # Calculate distance to swing center
+      contact_x = map_dbl(contact_loc, 1),
+      contact_y = map_dbl(contact_loc, 2),
+      contact_z = map_dbl(contact_loc, 3),
+      dist_to_center = map2_dbl(swing_center_loc, 
+                                contact_loc,
+                                ~ sqrt(sum((.x - .y)^2))),
+      
+      
+      # Calculate swing start location and bat vector
+      swing_start_loc = map(dist_to_center, ~ c(-., 0, 0)),
+      bat_vec = map2(contact_loc, swing_center_loc, ~ .x - .y),
+      
+      
+      # Calculate central arc angle and swing radius
+      central_arc_angle = map2_dbl(
+        bat_vec,
+        swing_start_loc,
+        ~ acos(sum(.x * .y) / (sqrt(sum(.x^2)) * sqrt(sum(.y^2))))),
+      
+      swing_radius = swing_length / central_arc_angle,
+      
+      
+      # distance to sweet spot
+      dist_to_sweet_spot = pmax(pmin(swing_radius - dist_to_center, 3), -3),
+      
+      
+      # great circle vector
+      v_v1 = map(swing_start_loc, ~ . / sqrt(sum(.^2))),
+      v_v2 = map(bat_vec, ~ . / sqrt(sum(.^2))),
+      v_w = pmap(list(v_v1, v_v2),
+                 function(v1, v2) {
+                   d <- sum(v1 * v2)
+                   b <- roots(c(1 - d^2, 0, -1))[1]
+                   a <- -d * b
+                   w <- a * v1 + b * v2
+                   return(w)
                  }),
-         
-         
-     # Calculate swing path
-     #swing_path = pmap(list(dist_to_center, 
-      #                      central_arc_angle, 
-       #                     v_v1, 
-        #                    v_w, 
-         #                   swing_center_loc), 
-          #             function(dist_to_center, 
-           #                     central_arc_angle, 
-            #                    v_v1, 
-             #                   v_w, 
-              #                  swing_center_loc) {
-      # t <- seq(0, central_arc_angle, length.out = 33
-       #         )
-      # path <- dist_to_center * 
-       #  (v_v1 * cos(t) + v_w * sin(t)) + 
-        # swing_center_loc
-       
-       
-      # return(path)
-     #}),
-     
-         
-         
-   # swing tangent at contact
-   swing_tangent_at_contact = pmap(
-     list(dist_to_center, v_v1, v_w, swing_center_loc),
-     function(dist_to_center, v1, w, swing_center_loc) {
-       dist_to_center * (-v1 * sin(0) + w * cos(0))
-       }),
-   
-   
-   centerline_angle = asin((12*abs(contact_z - plate_z)) / 2.7) * (180 / pi),
-   
+      
 
-   # vertical bat angle (VBA)
-   vertical_bat_angle = map_dbl(bat_vec, function(bat_vec) {
-     vba <- atan2(bat_vec[3], sqrt(sum(bat_vec[1:2]^2))) * (180 / pi)
-     return(vba)
-   }),
-   
-   
-   #vertical_bat_angle = atan2(bat_vec[3], 
-    #                          sqrt(sum(bat_vec[1:2]^2))) * (180 / pi),
-   
-   
-   # Vertical Approach Angle (VAA)
-   vy_f = -sqrt(vy0**2 - (2 * ay * (50 - (17 /12)))),
-   VAA = -atan((vz0 + (az * ((vy_f - vy0) / ay))) / vy_f) * (180 / pi),
-   
-   # Horizontal Approach Angle (HAA)
-   vx_f = vx0 + (ax * ((vy_f - vy0) / ay)),
-   HAA = -atan(vx_f / vy_f) * (180 / pi)
-   ) %>%
+      # swing tangent at contact
+      swing_tangent_at_contact = pmap(
+        list(dist_to_center, v_v1, v_w, swing_center_loc),
+        function(dist_to_center, v1, w, swing_center_loc) {
+          dist_to_center * (-v1 * sin(0) + w * cos(0))
+        }),
+      
+      
+      centerline_angle = asin((12*abs(contact_z - plate_z)) / 2.7) * 
+        (180 / pi),
+      
+      
+      # Vertical Bat Angle (VBA)
+      vertical_bat_angle = map_dbl(bat_vec, function(bat_vec) {
+        vba <- atan2(bat_vec[3], sqrt(sum(bat_vec[1:2]^2))) * (180 / pi)
+        return(vba)
+      }),
+      
+      
+      # Vertical Approach Angle (VAA)
+      vy_f = -sqrt(vy0**2 - (2 * ay * (50 - (17 /12)))),
+      VAA = -atan((vz0 + (az * ((vy_f - vy0) / ay))) / vy_f) * (180 / pi),
+      
+      # Horizontal Approach Angle (HAA)
+      vx_f = vx0 + (ax * ((vy_f - vy0) / ay)),
+      HAA = -atan(vx_f / vy_f) * (180 / pi)
+      ) %>%
+    
+    
+    # Adjusting VAA for Pitch Type and Pitch Height
+    # Adjusting HAA for Pitch Type, Location, Handedness and Release Pos 
+    group_by(pitch_name) %>%
+    group_modify(~ {
+      vaa_model <- lm(VAA ~ plate_z, data = .x) 
+      haa_model <- lm(HAA ~ plate_x + is_lhp + release_pos_x, data = .x) 
+      .x %>% 
+        mutate(VAAAA = resid(vaa_model),
+               HAAAA = resid(haa_model))
+      }) %>%
+    ungroup() %>%
+    
+    
+    # Cleaning
+    as.data.frame() %>%
+    arrange(uid) %>%
+    select(-game_type, -game_year) %>% # irrelevant
+    relocate(pitch_name, .before = pitch_type) %>%
+    
+    mutate(across(c(where(is.character)), ~ as.factor(.x)))
+  
+  return(df)
+  }
 
-  
-  # Adjusting VAA for Pitch Type and Pitch Height
-  # Adjusting HAA for Pitch Type, Location, Handedness and Release Pos 
-  group_by(pitch_name) %>%
-  group_modify(~ {
-    vaa_model <- lm(VAA ~ plate_z, data = .x) 
-    haa_model <- lm(HAA ~ plate_x + is_lhp + release_pos_x, data = .x) 
-    .x %>% 
-      mutate(VAAAA = resid(vaa_model),
-             HAAAA = resid(haa_model))
-    }) %>%
-  ungroup() %>%
-  mutate(outcome_woba = case_when(outcome_code == "0" ~ 0,
-                                  outcome_code == "1" ~ 0.882,
-                                  outcome_code == "2" ~ 1.253,
-                                  outcome_code == "3" ~ 1.587,
-                                  outcome_code == "4" ~ 2.044)) %>%
-  
-  # Cleaning
-  as.data.frame() %>%
-  arrange(uid) %>%
-  select(-game_type, -game_year) %>% # irrelevant
-  relocate(pitch_name, .before = pitch_type) %>%
-  relocate(outcome, 
-           #outcome_code, outcome_woba, 
-           .after = last_col())
+
+# Pre-processing Train and Test
+train_mod <- preprocess(train) %>%
+  relocate(outcome, .after = last_col())
+test_mod <- preprocess(test)
 
 
 
@@ -260,8 +252,9 @@ train_mod %>%
   #filter(outcome_code == 4) %>%
   head(n = 5)
 
-train_mod %>%
-  filter(centerline_angle == "NaN")
+bunts <- train_mod %>%
+  filter(squared_up_pct > 1)
+
 
 
 
@@ -272,7 +265,7 @@ ggplot(train_mod #%>% sample_n(2000),
        ,
        aes(x = plate_x, 
            y = plate_z,
-           z = outcome_woba
+           z = outcome_code
            #shape = attack_zone,
            #color = outcome
            )) +
@@ -405,7 +398,7 @@ ggplot(train_mod, aes(x = VAA, y = plate_z, color = outcome)) +
 
 
 ggplot(train_mod %>% filter(pitch_name == "4-Seam Fastball"), 
-       aes(x = VAAAA, y = plate_z, z = outcome_woba)) +
+       aes(x = VAAAA, y = plate_z, z = outcome_code)) +
   stat_summary_hex(bins = 50, fun = mean) +
   scale_fill_gradient(low = "blue", 
                       high = "red", 
@@ -586,19 +579,19 @@ swing_path <- matrix(unlist(train_mod$swing_path[6]),
 ## XGBoost Model ----------------------------------------------------------
 
 features <- c("effective_speed", 
-              "release_pos_x", "release_pos_y", "release_pos_z",
-              #"pfx_x", "pfx_z", 
+              "is_lhp", "is_lhb", "balls", "strikes",
+              "plate_x", "plate_z", "outs_when_up",
+              "inning", "is_top",
               "release_spin_rate", "release_extension",
-              "spin_axis", "spray_angle", #"direction", 
+              "spin_axis", "spray_angle",
               "bat_speed", "swing_length",
-              #"attack_zone", 
-              "plate_x", "plate_z",
               "batter_platoon_adv",
               "swing_efficiency", "swing_time", "swing_acceleration",
-              "max_ev", "movement_complexity",
-              "contact_x", "contact_y", "contact_z", "central_arc_angle",
-              "swing_radius", "dist_to_sweet_spot", "centerline_angle",
-              "vertical_bat_angle", "VAA", "VAAAA", "HAA", "HAAAA")
+              "is_bunt", "estimated_ev", "max_ev", "squared_up_pct", 
+              "sweet_spot_probability", "movement_complexity",
+              "centerline_angle", "vertical_bat_angle", 
+              "VAA", "VAAAA", "HAA", "HAAAA")
+
 
 
 
@@ -607,14 +600,17 @@ X <- model.matrix(~ . - 1, data = train_mod[, features])
 y <- train_mod$outcome_code
 dtrain <- xgb.DMatrix(data = X, label = y)
 
+X_test <- model.matrix(~ . - 1, data = test_mod[, features])
+dtest <- xgb.DMatrix(data = X_test)
+
 
 # Set parameters for XGBoost
 params <- list(
   booster = "gbtree",
   objective = "multi:softprob",
   eval_metric = "auc",   
-  max_depth = 10,
-  eta = 0.1,
+  max_depth = 5,
+  eta = 0.3,
   nthread = 4,
   subsample = 0.8,
   colsample_bytree = 0.8,
@@ -626,7 +622,7 @@ params <- list(
 xgb_model <- xgb.train(
   params = params,
   data = dtrain,
-  nrounds = 200,
+  nrounds = 100,
   watchlist = list(train = dtrain),
   print_every_n = 10
 )
@@ -640,11 +636,11 @@ xgb.plot.importance(importance)
 
 
 # K-fold Cross-Validation
-set.seed(1234)
+set.seed(12342)
 cv_model <- xgb.cv(
   params = params,
   data = dtrain,
-  nrounds = 500,
+  nrounds = 100,
   nfold = 5,
   stratified = TRUE,
   early_stopping_rounds = 10,
@@ -678,7 +674,7 @@ ggplot(melt(as.data.frame(cbind(
 
 
 ## Hyperparameter Tuning: Bayesian Optimization ---------------------------
-set.seed(5678)
+set.seed(442)
 opt_result <- bayesOpt(
   FUN = function(nrounds, max_depth, eta, subsample, colsample_bytree,
                  lambda, alpha) {
@@ -691,8 +687,9 @@ opt_result <- bayesOpt(
       subsample = subsample,
       colsample_bytree = colsample_bytree,
       lambda = lambda,
-      alpha = alpha
-    )
+      alpha = alpha,
+      nthread = 4
+      )
     cv_result <- xgb.cv(
       params = params_tuned,
       data = dtrain,
@@ -700,21 +697,21 @@ opt_result <- bayesOpt(
       nrounds = nrounds,
       verbose = 0,
       num_class = 5
-    )
+      )
     list(Score = -min(cv_result$evaluation_log$test_auc_mean))
   },
   bounds <- list(
-    nrounds = c(10L, 500L),
-    eta = c(0.001, 1),
+    nrounds = c(50L, 100L),
+    eta = c(0.1, 1),
     max_depth = c(1L, 20L),
     colsample_bytree = c(0.1, 1),
     subsample = c(0.1, 1),
-    lambda = c(1, 15),
-    alpha = c(1, 15)
-  ),
-  initPoints = 25,
+    lambda = c(1, 10),
+    alpha = c(1, 10)
+    ),
+  initPoints = 10,
   plotProgress = TRUE
-)
+  )
 
 
 tuned_params <- append(list(
@@ -723,25 +720,26 @@ tuned_params <- append(list(
   eval_metric = "auc",  
   nthread = 4),
   getBestPars(opt_result)
-)
+  )
 
+tuned_params$max_depth <- 6
 
 
 
 
 ## Re-fitting Tuned XGBoost Model -----------------------------------------
 # K-fold Cross-Validation
-set.seed(987)
+set.seed(442)
 tuned_cv_model <- xgb.cv(
   params = tuned_params,
   data = dtrain,
-  nrounds = tuned_params$nrounds,
-  nfold = 5,
+  nrounds = 200,
+  nfold = 10,
   stratified = TRUE,
-  early_stopping_rounds = 10,
+  early_stopping_rounds = 50,
   print_every_n = 10,
   num_class = 5
-)
+  )
 
 
 # Tuned AUC Plot
@@ -763,18 +761,20 @@ ggplot(melt(as.data.frame(cbind(
   theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
         axis.title = element_text(face = "bold", size = 12),
         legend.title = element_blank(),  
-        legend.position = "top") 
+        legend.position = "top"
+        ) 
 
 
 # Final Tuned Model using tuned hyperparams
 tuned_xgb_model <- xgb.train(
   params = tuned_params,
   data = dtrain,
-  nrounds = tuned_cv_model$best_iteration,
+  #nrounds = tuned_cv_model$best_iteration,
+  nrounds = 250,
   watchlist = list(train = dtrain),
   print_every_n = 10,
   num_class = 5
-)
+  )
 
 
 # Tuned Feature importance
@@ -784,5 +784,20 @@ print(tuned_importance)
 xgb.plot.importance(tuned_importance)
 
 
+pred <- predict(tuned_xgb_model, newdata = dtrain, reshape = T) %>%
+  as.data.frame()
 
+colnames(pred) <- c("p_out", "p_single", "p_double", 
+                    "p_triple", "p_home_run")
+
+train_mod_results <- train_mod %>%
+  cbind(pred)
+
+
+test_results <- test %>%
+  cbind(predict(tuned_xgb_model, newdata = dtest, reshape = T)) %>%
+  as.data.frame() %>%
+  select(uid, '1', '2', '3', '4', '5')
+
+write.csv(test_results, file = "test_results.csv")
 
